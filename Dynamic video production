@@ -1,0 +1,172 @@
+import os
+import glob
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.ticker import FixedLocator, FixedFormatter
+from io import BytesIO
+from matplotlib.animation import FuncAnimation, FFMpegWriter
+import concurrent.futures
+import imageio.v2 as imageio
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
+import geopandas as gpd
+from pyproj import Geod
+
+# ---------------- Global font Settings ----------------
+plt.rcParams["font.family"] = "Arial"
+
+# ---------------- Auxiliary function ----------------
+def add_scalebar(ax, total_length_km, location=(0.1, 0.05), linewidth=3, color='black'):
+    geod = Geod(ellps="WGS84")
+    extent = ax.get_extent(crs=ccrs.PlateCarree())  # [west, east, south, north]
+    west, east, south, north = extent
+    lon = west + (east - west) * location[0]
+    lat = south + (north - south) * location[1]
+    lon_total, lat_total, _ = geod.fwd(lon, lat, 90, total_length_km * 1000)
+    half_length = total_length_km / 2.0
+    lon_half, lat_half, _ = geod.fwd(lon, lat, 90, half_length * 1000)
+    ax.plot([lon, lon_total], [lat, lat_total],
+            transform=ccrs.PlateCarree(), color=color, linewidth=linewidth)
+    tick_length = (east - west) * 0.005
+    for x in [lon, lon_half, lon_total]:
+        ax.plot([x, x],
+                [lat - tick_length, lat + tick_length],
+                transform=ccrs.PlateCarree(), color=color, linewidth=linewidth)
+    ax.text(lon_half, lat - tick_length * 4, f'{half_length:.0f} km',
+            transform=ccrs.PlateCarree(), ha='center', va='top', color=color, fontsize=10)
+    ax.text(lon_total, lat - tick_length * 4, f'{total_length_km:.0f} km',
+            transform=ccrs.PlateCarree(), ha='center', va='top', color=color, fontsize=10)
+
+def add_north_arrow(ax, location=(0.05, 0.95), height=0.1, color='black'):
+  
+    ax.annotate('N', xy=(location[0], location[1]),
+                xytext=(location[0], location[1]-height),
+                arrowprops=dict(facecolor=color, width=5, headwidth=15),
+                ha='center', va='center', fontsize=12, xycoords=ax.transAxes)
+
+# ---------------- Input and Output parameter Settings ----------------
+daily_output_folder = r"Daily ETbedrock maps"
+mp4_output_path = os.path.join(daily_output_folder, "daily_VTbedrock_animation.mp4")
+
+# Obtain all TIFF files (the first 8 digits of the file name represent the date), with a total of 4018 files
+file_list = sorted(glob.glob(os.path.join(daily_output_folder, "*.tif")),
+                   key=lambda x: os.path.basename(x)[:8])
+print("Found files:", len(file_list))
+
+# Sample one frame for every 10 files (approximately 402 frames)
+subsampled_files = file_list[::10]
+print("Frames used:", len(subsampled_files))
+
+# Preload all the sampled TIFF data into memory
+def load_tiff(file):
+    with rasterio.open(file) as src:
+        data = src.read(1)
+        bounds = src.bounds  
+        data = np.clip(data, 0, 30)  
+    return data, bounds
+
+all_data = []
+all_bounds = None
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    results = list(executor.map(load_tiff, subsampled_files))
+    for data, bounds in results:
+        all_data.append(data)
+        if all_bounds is None:
+            all_bounds = bounds
+
+# ---------------- colormap  ----------------
+vmin_fixed = 0
+vmax_fixed = 30
+vmin_positive = 1e-6  
+custom_cmap = mcolors.LinearSegmentedColormap.from_list("custom", ["#FFCC99", "#00008B"])
+custom_cmap.set_under("lightgray")  
+norm = mcolors.Normalize(vmin=vmin_positive, vmax=vmax_fixed, clip=False)
+ticks = [0, 1, 5, 10, 20, 30, 31]
+tick_labels = ["0", "1", "5", "10", "20", "30", ">30+"]
+
+# ---------------- read shapefile ----------------
+china_shp_path = r"XXXX.shp"      # The planar document of China's border
+dash_shp_path  = r"XXXX.shp"  # Auxiliary documents
+
+china_gdf = gpd.read_file(china_shp_path)
+dash_gdf  = gpd.read_file(dash_shp_path)
+
+# ---------------- Create the main image ----------------
+lambert_proj = ccrs.LambertConformal(central_longitude=105, central_latitude=35,
+                                      standard_parallels=(25, 47))
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(1, 1, 1, projection=lambert_proj)
+ax.set_extent([70, 150, 15, 65], crs=ccrs.PlateCarree())
+ax.set_facecolor("white")
+fig.patch.set_facecolor("white")
+ax.set_title("Estimated VT$_{bedrock}$ across China", fontsize=16)
+
+ax.add_feature(cfeature.OCEAN, facecolor="deepskyblue", zorder=0)
+for geom in china_gdf.geometry:
+    ax.add_geometries([geom], crs=ccrs.PlateCarree(), facecolor="none",
+                      edgecolor="red", linewidth=2)
+ax.coastlines(resolution="50m", color="black", linewidth=1)
+gl = ax.gridlines(draw_labels=True, crs=ccrs.PlateCarree(), linewidth=0.5,
+                  color="gray", alpha=0.7, linestyle="--", x_inline=False)
+gl.top_labels = False
+gl.right_labels = False
+gl.xformatter = LongitudeFormatter()
+gl.yformatter = LatitudeFormatter()
+
+add_scalebar(ax, total_length_km=1320, location=(0.1, 0.05), linewidth=3, color="black")
+add_north_arrow(ax, location=(0.05, 0.95), height=0.1, color="black")
+
+# ---------------- Create a subgraph (embedded in the lower right corner of the main graph)） ----------------
+main_ax_pos = ax.get_position()
+inset_width = 0.3 * main_ax_pos.width
+inset_height = 0.3 * main_ax_pos.height
+inset_left = main_ax_pos.x1 - inset_width
+inset_bottom = main_ax_pos.y0
+ax_inset = fig.add_axes([inset_left, inset_bottom, inset_width, inset_height],
+                        projection=lambert_proj)
+ax_inset.set_extent([104.5, 125, 0, 26], crs=ccrs.PlateCarree())
+ax_inset.patch.set_alpha(0)
+ax_inset.add_feature(cfeature.OCEAN, facecolor="deepskyblue", zorder=0)
+for geom in dash_gdf.geometry:
+    ax_inset.add_geometries([geom], crs=ccrs.PlateCarree(), facecolor="none",
+                            edgecolor="blue", linestyle="--", linewidth=2)
+ax_inset.coastlines(resolution="50m", color="black", linewidth=0.2)
+_ = ax_inset.gridlines(draw_labels=False)
+
+# ---------------- Initialize the raster data display ----------------
+im_main = ax.imshow(all_data[0], cmap=custom_cmap, norm=norm,
+                    extent=(all_bounds.left, all_bounds.right, all_bounds.bottom, all_bounds.top),
+                    origin="upper", transform=ccrs.PlateCarree())
+im_inset = ax_inset.imshow(all_data[0], cmap=custom_cmap, norm=norm,
+                           extent=(all_bounds.left, all_bounds.right, all_bounds.bottom, all_bounds.top),
+                           origin="upper", transform=ccrs.PlateCarree())
+
+time_text = ax.text(0.5, 0.95, os.path.basename(subsampled_files[0])[:8],
+                    transform=ax.transAxes, color="white", fontsize=12,
+                    ha="center", va="top",
+                    bbox=dict(facecolor="black", alpha=0.5, edgecolor="none"))
+
+cbar = fig.colorbar(im_main, ax=ax, extend="both", ticks=ticks,
+                    fraction=0.046, pad=0.04)
+cbar.ax.yaxis.set_major_locator(FixedLocator(ticks))
+cbar.ax.yaxis.set_major_formatter(FixedFormatter(tick_labels))
+cbar.set_label("VT$_{bedrock}$ (mm)", fontsize=12)
+
+# ---------------- Use FuncAnimation for dynamic updates ----------------
+def update(frame_idx):
+    im_main.set_data(all_data[frame_idx])
+    im_inset.set_data(all_data[frame_idx])
+    time_text.set_text(os.path.basename(subsampled_files[frame_idx])[:8])
+    return [im_main, im_inset, time_text]
+
+frames_total = len(all_data)
+ani = FuncAnimation(fig, update, frames=frames_total, blit=True)
+
+# Use FFMpegWriter to output MP4 videos and specify a lower dpi to speed up the write process
+mp4_writer = FFMpegWriter(fps=5, metadata=dict(artist="YourName"), bitrate=1800)
+ani.save(mp4_output_path, writer=mp4_writer, dpi=300)
+plt.close(fig)
+print("MP4 animation saved to:", mp4_output_path)
