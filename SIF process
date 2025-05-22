@@ -1,0 +1,170 @@
+import os
+import rasterio
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy.optimize import curve_fit
+from scipy.signal import savgol_filter
+import matplotlib as mpl
+
+# ---------------------- Global font Settings ----------------------
+mpl.rcParams["font.family"] = "Arial"
+mpl.rcParams["xtick.labelsize"] = 14
+mpl.rcParams["ytick.labelsize"] = 12
+
+# ==================== Data reading and merging ====================
+# 设置数据文件夹路径
+data_folder = r"path to SIF data"
+
+start_date = pd.to_datetime("2009-08-01")
+end_date   = pd.to_datetime("2020-07-31")
+
+# read all file
+file_list = sorted([f for f in os.listdir(data_folder) if f.endswith(".tif")])
+
+# Parse the date from the file name
+dates = [pd.to_datetime(f.split("_")[1].split(".")[0]) for f in file_list]
+
+# 过滤出符合指定时间范围的文件及对应日期
+selected_files = [file_list[i] for i in range(len(dates)) if start_date <= dates[i] <= end_date]
+selected_dates = [dates[i] for i in range(len(dates)) if start_date <= dates[i] <= end_date]
+
+# Calculate the median SIF of each file (excluding outliers: data less than -1000 is considered invalid, and data less than 0 is set to 0).
+sif_medians = []
+for filename in selected_files:
+    with rasterio.open(os.path.join(data_folder, filename)) as dataset:
+        data = dataset.read(1)
+        data = np.where(data < -1000, np.nan, data)
+        data = np.where(data < 0, 0, data)
+        sif_medians.append(np.nanmedian(data))
+sif_medians = np.array(sif_medians)
+
+# ==================== Take the average value by grouping by "month - day" ====================
+# Bulit DataFrame
+df = pd.DataFrame({
+    'date': selected_dates,
+    'sif': sif_medians
+})
+# Extract the "month-day" string (in the format mm-dd, for example "08-01")
+df['md'] = df['date'].dt.strftime("%m-%d")
+
+# Take the average of the data of the same month and day in all years
+df_grouped = df.groupby('md', as_index=False).agg({'sif': 'mean'})
+
+# Sort naturally (mm-dd strings filled with zero can be sorted as "01-xx" to "12-xx")
+df_grouped = df_grouped.sort_values(by='md').reset_index(drop=True)
+
+# Construct the synthesized date for plotting - uniformly use the year 2000 (only display month-day information)
+composite_dates = pd.to_datetime("2000-" + df_grouped['md'])
+composite_sif   = df_grouped['sif'].values
+
+# ==================== Data completion: Slide the window to complete the daily data ====================
+# Since the original synthetic data is one point every eight days, construct a complete daily date sequence for the year 2000
+daily_dates = pd.date_range(start="2000-01-01", end="2000-12-31", freq='D')
+
+# Construct the Series using composite_dates and composite_sif, and reindex it to the daily
+composite_series = pd.Series(composite_sif, index=composite_dates)
+daily_series = composite_series.reindex(daily_dates)
+daily_series_interpolated = daily_series.interpolate(method='linear')
+
+# Use the sliding window (7-day average) to further smooth the data
+daily_series_smoothed = daily_series_interpolated.rolling(window=7, center=True, min_periods=1).mean()
+
+# Update the variables as the complete daily data for subsequent analysis
+full_dates = daily_series_smoothed.index   
+full_sif   = daily_series_smoothed.values 
+n_points   = len(full_sif)
+x_vals     = np.arange(n_points)
+
+# ==================== Finally, smooth and fit with double Sigmoid ====================
+# The completed data is smoothed again using the Savitzky-Golay filter
+window_length = 11 if n_points >= 11 else (n_points if n_points % 2 == 1 else n_points - 1)
+sif_smooth = savgol_filter(full_sif, window_length=window_length, polyorder=2)
+
+# Define the double Sigmoid model (refer to methods such as Shi et al., (2024) https://doi.org/10.1016/j.agrformet.2024.109888)
+def sigmoid_double(x, a1, a2, d1, b1, a3, d2, b2):
+    return a1 + (a2 / (1 + np.exp(-d1 * (x - b1)))) - (a3 / (1 + np.exp(-d2 * (x - b2))))
+
+# Estimate the initial parameters
+sif_min = np.nanmin(sif_smooth)
+sif_max = np.nanmax(sif_smooth)
+sif_amplitude = sif_max - sif_min
+
+p0 = [
+    sif_min,                   # a1
+    sif_amplitude * 0.8,       # a2
+    0.1,                       # d1
+    n_points * 0.3,            # b1
+    sif_amplitude * 0.6,       # a3
+    0.1,                       # d2
+    n_points * 0.7             # b2
+]
+
+# 对平滑后的数据进行双 Sigmoid 拟合
+popt, _ = curve_fit(sigmoid_double, x_vals, sif_smooth, p0=p0, maxfev=10000)
+a1, a2, d1, b1, a3, d2, b2 = popt
+
+# Calculate the index dates of SOS and EOS based on the model
+sos_index = int(b1 - (4.562 / (2 * d2)))
+eos_index = int(b2 + (4.562 / (2 * d2)))
+sos_index = max(0, min(n_points - 1, sos_index))
+eos_index = max(0, min(n_points - 1, eos_index))
+
+print(f"SOS (Double-Sigmoid): {full_dates[sos_index].strftime('%b')}")
+print(f"EOS (Double-Sigmoid): {full_dates[eos_index].strftime('%b')}")
+
+# ==================== Determine the Early Growth Phase by using the derivative method ====================
+# Calculate the first-order derivative on smooth data
+sif_derivative = np.gradient(sif_smooth)
+
+# Set the threshold based on the statistical distribution and assume that the winter dates are November, December, January and February
+winter_indices = [i for i, dt in enumerate(full_dates) if dt.month in [11, 12, 1, 2]]
+if len(winter_indices) > 0:
+    winter_deriv = sif_derivative[winter_indices]
+    winter_mean = np.mean(winter_deriv)
+    winter_std  = np.std(winter_deriv)
+    std_mult = 1  # It can be adjusted according to the actual data
+    deriv_threshold = winter_mean + std_mult * winter_std
+    print(f"Mean value of winter derivatives: {winter_mean:.4f}, std: {winter_std:.4f}, The threshold is set to: {deriv_threshold:.4f}")
+else:
+    deriv_threshold = np.min(sif_derivative) + 0.2 * (np.max(sif_derivative) - np.min(sif_derivative))
+    print(f"There is not enough winter data, and the threshold is set using the full-period proportional method: {deriv_threshold:.4f}")
+
+# Find the moment when the threshold is exceeded for the first time as the beginning of the Early Growth Phase
+egp_candidates = np.where(sif_derivative > deriv_threshold)[0]
+if len(egp_candidates) > 0:
+    egp_index = egp_candidates[0]
+    egp_date = full_dates[egp_index]
+    print(f"Early Growth Phase (Derivative) starts on: {egp_date.strftime('%b')}")
+else:
+    print("The Early Growth Phase (derivative method) was not detected")
+
+# ==================== Drawing ====================
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.patch.set_alpha(0.)
+
+plt.plot(full_dates, full_sif, 'o-', label="Composite Daily (Interpolated)", color="forestgreen", linewidth=0.6, markersize=3)
+
+plt.plot(full_dates, sigmoid_double(x_vals, *popt), 'r-', label="Fitted Curve (Double-Sigmoid)")
+
+plt.axvline(full_dates[sos_index], color='darkgreen', linestyle="--", label="SOS (Double-Sigmoid)")
+plt.axvline(full_dates[eos_index], color='red', linestyle="--", label="EOS (Double-Sigmoid)")
+# If the Early Growth Phase is detected, plot its position
+if len(egp_candidates) > 0:
+    plt.axvline(egp_date, color='steelblue', linestyle="--", label="SOE (Derivative)")
+
+
+plt.ylabel("SIF (mW·m$^{-2}$·nm$^{-1}$·sr$^{-1}$)", fontsize=18)
+
+plt.legend(loc="upper right")
+plt.grid(False)
+plt.tight_layout()
+
+# Set the date format on the X-axis to display only the English abbreviation of the month
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+
+
+# SAVe and Show
+plt.savefig(r"XXXX.tif", dpi=500, bbox_inches='tight')
+plt.show()
