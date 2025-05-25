@@ -30,7 +30,7 @@ def process_period_daily(start_date, end_date, base_path):
     output_a_folder = os.path.join(base_path, 'A__daily')
     os.makedirs(output_a_folder, exist_ok=True)
 
-    # 逐日处理数据
+    # Process daily data
     for date in dates:
         sc_file = os.path.join(base_path, 'snowcover', f'sc{date}.tif')
         pre_file = os.path.join(base_path, 'P', f'P{date}.tif')
@@ -84,7 +84,7 @@ def process_period_daily(start_date, end_date, base_path):
                 et_data = np.clip(et_data, 0, 1000)
 
             
-            cumulative_precip = pre_data  # 每日数据直接作为累计输入
+            cumulative_precip = pre_data 
 
             # Calculate(ET-P)，and apply the snowcover mask
             diff_data = (et_data - cumulative_precip) * sc_data
