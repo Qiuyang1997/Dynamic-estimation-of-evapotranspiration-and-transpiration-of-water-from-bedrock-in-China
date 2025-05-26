@@ -2,7 +2,7 @@ Water stored in bedrock plays an indispensable role in ecosystems’ water suppl
 
 In this project, we have released reproducible codes for calculating daily evapotranspiration from bedrock reservoirs and vegetation transpiration based on soil available water, ET, and P, which mainly consist of three parts: 1. Main calculation code (including deficits of ET-P, SSS dynamic estimation, ET_bedrock and VT_bedrock estimation); 2. Analysis of phenological characteristics of the ecosystem 3. Video production of daily estimated values.  
 
-if you run into any problems using this code for scientific research, first check that your files are named and saved in a canonical format (including but not limited to uniform resolution and coordinate systems), and then check that your python environment is configured correctly. Finally, you can contact me: Dr. Yang Qiu （邱洋, Shcool of Environmental Studies, China University of Geosciences, Wuhan, China) :qiuyang19970819@163.com or qiuyang@cug.edu.cn.
+If you run into any problems using this code for scientific research, first check that your files are named and saved in a canonical format (including but not limited to uniform resolution and coordinate systems), and then check that your python environment is configured correctly. Finally, you can contact me: Dr. Yang Qiu （邱洋, Shcool of Environmental Studies, China University of Geosciences, Wuhan, China) :qiuyang19970819@163.com or qiuyang@cug.edu.cn.
 
 If you use this code (or modify it to use it) to publish an article, patent, monograph, or other work, please cite my paper (under update). I would really appreciate it!
 
