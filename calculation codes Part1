@@ -1,4 +1,4 @@
-###----------PART 1 Calculation of the difference of ET-P ------------------###
+###----------PART 1 Calculation of the difference of ET-P (A)------------------###
 import os
 import numpy as np
 import rasterio
