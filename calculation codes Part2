@@ -1,0 +1,74 @@
+###----------PART 2 Calculation of the water deficit (d)------------------###
+import os
+import numpy as np
+import rasterio
+
+def get_tif_files(directory):
+    
+    files = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if f.lower().endswith('.tif')
+    ]
+    files.sort()
+    return files
+
+
+aaa_directory = r"path to A floder"   # 存放 A*.tif 的文件夹
+bbb_directory = r"path to d floder"   # 输出 D*.tif 的文件夹
+os.makedirs(bbb_directory, exist_ok=True)
+
+aaa_files = get_tif_files(aaa_directory)
+if not aaa_files:
+    raise RuntimeError(f"No .tif files found in {aaa_directory}")
+
+# Read the first file to obtain metadata and block window information
+with rasterio.open(aaa_files[0]) as src0:
+    meta = src0.meta.copy()
+    meta.update(dtype=rasterio.float32, count=1)
+    height, width = src0.height, src0.width
+    block_windows = list(src0.block_windows(1))
+
+# Initial
+initial_data = np.zeros((height, width), dtype=np.float32)
+counter      = np.zeros((height, width), dtype=np.int32)
+
+# Processing
+for aaa_path in aaa_files:
+    print(f"Processing {aaa_path} …")
+    with rasterio.open(aaa_path) as src_aaa:
+        for ji, window in block_windows:
+            
+            aaa_block = src_aaa.read(1, window=window).astype(np.float32)
+            mask_pos    = aaa_block > 0
+            mask_nonpos = ~mask_pos
+
+            row0, col0 = window.row_off, window.col_off
+            h, w       = window.height, window.width
+            cnt_block  = counter[row0:row0+h, col0:col0+w]
+            cnt_block[mask_pos]    += 1    
+            cnt_block[mask_nonpos]  = 0    
+            counter[row0:row0+h, col0:col0+w] = cnt_block
+
+            # Reset the cumulative value of the corresponding pixel before the 731st (2nd year) positive accumulation
+            reset_mask = cnt_block > 730
+            init_block = initial_data[row0:row0+h, col0:col0+w]
+            init_block[reset_mask] = 0
+
+            init_block += aaa_block
+            init_block[init_block<0] = 0
+
+            # 6. write back to initial_data
+            initial_data[row0:row0+h, col0:col0+w] = init_block
+
+            # 7clean memory
+            del aaa_block, cnt_block, init_block
+
+    # Output
+    out_name = os.path.basename(aaa_path).replace('A', 'D', 1)
+    out_path = os.path.join(bbb_directory, out_name)
+    print(f"  → Writing {out_path}")
+    with rasterio.open(out_path, 'w', **meta) as dst:
+        dst.write(initial_data, 1)
+
+print("All done.")
