@@ -1,3 +1,4 @@
+###----------PART 6 Calculation of the Dmax and Sr------------------###
 import os
 import glob
 import numpy as np
