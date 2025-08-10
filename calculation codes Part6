@@ -1,0 +1,66 @@
+import os
+import glob
+import numpy as np
+import rasterio
+from datetime import datetime
+
+
+in_dir  = r"path to floder d"
+out_dir = r"path to Dmax and Sr"
+os.makedirs(out_dir, exist_ok=True)
+
+
+pattern = os.path.join(in_dir, "D*.tif")
+files = sorted(glob.glob(pattern))
+
+
+groups = {}
+for fp in files:
+    name = os.path.basename(fp)
+    # 提取日期字符串 DYYYYMMDD.tif -> YYYYMMDD
+    dt_str = name.lstrip("D").split(".")[0]
+    dt = datetime.strptime(dt_str, "%Y%m%d")
+    # 月份 >=8 则算入下一年，否则算当年
+    yr = dt.year + 1 if dt.month >= 8 else dt.year
+    groups.setdefault(yr, []).append(fp)
+
+
+with rasterio.open(files[0]) as src0:
+    meta = src0.meta.copy()
+    nodata = src0.nodata
+    dtype = src0.dtypes[0]
+    h, w   = src0.height, src0.width
+
+
+for yr, fplist in sorted(groups.items()):
+    print(f"Processing year {yr}, {len(fplist)} files …")
+    
+    max_arr = np.full((h, w), -np.inf, dtype="float32")
+
+    for fp in fplist:
+        with rasterio.open(fp) as src:
+            data = src.read(1).astype("float32")
+            
+            mask = (data == src.nodata) | np.isnan(data)
+            data[mask] = -np.inf
+            
+            np.maximum(max_arr, data, out=max_arr)
+
+   
+    max_arr[max_arr == -np.inf] = nodata
+
+    
+    out_meta = meta.copy()
+    out_meta.update({
+        "dtype": dtype,
+        "nodata": nodata,
+        "compress": "lzw"
+    })
+    out_fp = os.path.join(out_dir, f"Dmax_{yr}.tif")
+
+    with rasterio.open(out_fp, "w", **out_meta) as dst:
+        dst.write(max_arr.astype(dtype), 1)
+
+    print(f" → Saved: {out_fp}")
+
+print("All done.")
