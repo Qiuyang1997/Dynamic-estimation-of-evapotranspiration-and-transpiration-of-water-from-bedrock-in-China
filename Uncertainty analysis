@@ -1,0 +1,281 @@
+# -*- coding: utf-8 -*-
+import os
+import gc
+import psutil
+import numpy as np
+import rasterio
+from rasterio.windows import from_bounds
+from tqdm import tqdm
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+def get_memory_usage():
+    """Due to the huge amount of computation, we adopt batch calculation. Here, the memory usage of each batch is displayed"""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024 / 1024
+
+
+class OnlineStats:
+        def __init__(self, shape):
+        self.n = 0
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.M2 = np.zeros(shape, dtype=np.float64)  
+
+    def update(self, x):
+        """updata information"""
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        delta2 = x - self.mean
+        self.M2 += delta * delta2
+
+    def get_std(self):
+        """std"""
+        if self.n < 2:
+            return np.zeros_like(self.mean)
+        variance = self.M2 / (self.n - 1)
+        return np.sqrt(variance)
+
+    def get_mean(self):
+        """mran"""
+        return self.mean.copy()
+
+
+def process_daily_batch(dates_batch, input_folder, et_folder, vt_folder, precip_folder,
+                        soil_capacity, soil_initial, soil_bounds, M,
+                        bias_et_vt, sigma_et_vt, sigma_precip):
+   
+    nrow, ncol = soil_capacity.shape
+    ndays_batch = len(dates_batch)
+
+   
+    etb_stats = [OnlineStats((nrow, ncol)) for _ in range(ndays_batch)]
+    vtb_stats = [OnlineStats((nrow, ncol)) for _ in range(ndays_batch)]
+
+    print(f"start {ndays_batch} ，total {M} runs...")
+
+    # Monte Carlo cycle
+    for m in tqdm(range(M), desc="Monte Carlo runs"):
+        # Reset the soil water status for each realization
+        soil_water = soil_initial.copy()
+
+        for di, date in enumerate(dates_batch):
+            try:
+                
+                A_path = os.path.join(input_folder, f"A{date}.tif")
+                ET_path = os.path.join(et_folder, f"ET{date}.tif")  # 添加ET文件读取
+                VT_path = os.path.join(vt_folder, f"VT{date}.tif")
+                PR_path = os.path.join(precip_folder, f"{date}.tif")
+
+                
+                for path, name in [(A_path, "A"), (ET_path, "ET"), (VT_path, "VT"), (PR_path, "")]:
+                    if not os.path.exists(path):
+                        print(f"警告：文件不存在 {path}")
+                        # 如果关键文件不存在，跳过这一天
+                        continue
+
+                
+                with rasterio.open(A_path) as src:
+                    win = from_bounds(*soil_bounds, transform=src.transform)
+                    A_raw = src.read(1, window=win).astype(np.float64)
+
+                with rasterio.open(ET_path) as src:
+                    win = from_bounds(*soil_bounds, transform=src.transform)
+                    ET_raw = src.read(1, window=win).astype(np.float64)
+
+                with rasterio.open(VT_path) as src:
+                    win = from_bounds(*soil_bounds, transform=src.transform)
+                    VT_raw = src.read(1, window=win).astype(np.float64)
+
+                with rasterio.open(PR_path) as src:
+                    win = from_bounds(*soil_bounds, transform=src.transform)
+                    PR_raw = src.read(1, window=win).astype(np.float64)
+
+                
+                for arr in (A_raw, ET_raw, VT_raw, PR_raw):
+                    arr[np.isnan(arr)] = 0.0
+                    arr[np.isinf(arr)] = 0.0
+
+                # Inject Monte Carlo noise
+                
+                A_m = A_raw + np.random.normal(bias_et_vt, sigma_et_vt, (nrow, ncol))
+                ET_m = ET_raw + np.random.normal(bias_et_vt, sigma_et_vt, (nrow, ncol))
+                VT_m = VT_raw + np.random.normal(bias_et_vt, sigma_et_vt, (nrow, ncol))
+                PR_m = PR_raw + np.random.normal(0.0, sigma_precip, (nrow, ncol))
+                PR_m[PR_m < 0] = 0.0
+
+
+                evap_diff = A_m - PR_m
+                evap_diff = np.clip(evap_diff, -1e3, 1e3)
+                evap_diff[np.isnan(evap_diff)] = 0.0
+                evap_diff[np.isinf(evap_diff)] = 0.0
+
+               
+                pos_mask = evap_diff > 0
+                neg_mask = evap_diff < 0
+
+                daily_ETb = np.zeros_like(soil_capacity)
+                daily_VTb = np.zeros_like(soil_capacity)
+
+                
+                if pos_mask.any():
+                    soil_def = evap_diff[pos_mask] - soil_water[pos_mask]
+                    soil_def[soil_def < 0] = 0.0
+                    daily_ETb[pos_mask] = soil_def
+
+                    soil_water[pos_mask] -= evap_diff[pos_mask]
+
+                    cond = soil_water[pos_mask] < VT_m[pos_mask]
+                    rock_provide = VT_m[pos_mask] - soil_water[pos_mask]
+                    rock_provide[~cond] = 0.0
+                    daily_VTb[pos_mask] = rock_provide
+
+                
+                soil_water = np.clip(soil_water, 0.0, soil_capacity)
+
+                
+                if neg_mask.any():
+                    soil_water[neg_mask] += -evap_diff[neg_mask]
+                    excess = soil_water - soil_capacity
+                    spill = excess > 0
+                    soil_water[spill] = soil_capacity[spill]
+
+               
+                etb_stats[di].update(daily_ETb.astype(np.float32))
+                vtb_stats[di].update(daily_VTb.astype(np.float32))
+
+            except Exception as e:
+                print(f"wrong {date} : {e}")
+                continue
+
+        
+        if (m + 1) % 100 == 0:
+            gc.collect()
+            current_memory = get_memory_usage()
+            print(f"done {m + 1}/{M} run: {current_memory:.2f} GB")
+
+    return etb_stats, vtb_stats
+
+
+def main():
+    
+    M = 100  # runs
+
+    # The uncertainty of input data
+    bias_et_vt = -0.17  # mm/d
+    rmse_et_vt = 1.02  # mm/d
+    mae_precip = 1.48  # mm/d
+
+    sigma_et_vt = rmse_et_vt
+    sigma_precip = mae_precip
+
+    # input path
+    input_folder = r"path to A floder"  # A(ET-P)
+    et_folder = r"path to ET floder"  # ET
+    vt_folder = r"path to VT floder"  # VT
+    precip_folder = r"path to P floder"  # precipitation
+
+    soil_file = r"soil.tif"
+    soil_initial_file = r"initial Ssoil.tif"
+
+    # output
+    out_uncertainty = r"I:\Uncertainty\results"
+    os.makedirs(out_uncertainty, exist_ok=True)
+
+    print(f": {get_memory_usage():.2f} GB")
+
+    
+    
+    with rasterio.open(soil_file) as src:
+        soil_bounds = src.bounds
+        soil_capacity = src.read(1).astype(np.float64)
+        meta_profile = src.meta.copy()
+
+    with rasterio.open(soil_initial_file) as src:
+        soil_initial = src.read(1).astype(np.float64)
+
+    nrow, ncol = soil_capacity.shape
+    print(f"数据维度: {nrow} x {ncol}")
+
+    
+    daily_files = sorted([
+        f for f in os.listdir(input_folder)
+        if f.startswith("A") and f.endswith(".tif")
+    ], key=lambda x: x[1:9])
+
+    dates = [fn[1:9] for fn in daily_files]
+    ndays = len(dates)
+    print(f"find {ndays} days data")
+
+    
+    missing_files = []
+    for date in dates[:5]:  
+        for folder, prefix in [(et_folder, "ET"), (vt_folder, "VT"), (precip_folder, "")]:
+            file_path = os.path.join(folder, f"{prefix}{date}.tif")
+            if not os.path.exists(file_path):
+                missing_files.append(file_path)
+
+    if missing_files:
+        print("Warning: Missing files found：")
+        for f in missing_files:
+            print(f"  - {f}")
+        
+
+    # estimated_memory_gb
+    estimated_memory_gb = (M * 50 * nrow * ncol * 4) / (1024 ** 3)  # 粗略估算
+    print(f": {estimated_memory_gb:.2f} GB")
+
+    
+    batch_size = min(20, ndays)  
+    if estimated_memory_gb > 8:  
+        batch_size = min(20, ndays)
+
+    print(f" {int(np.ceil(ndays / batch_size))} processing， {batch_size} days")
+
+   
+    for batch_start in range(0, ndays, batch_size):
+        batch_end = min(batch_start + batch_size, ndays)
+        dates_batch = dates[batch_start:batch_end]
+
+        print(f"\nprocessing {batch_start // batch_size + 1}: 日期 {dates_batch[0]} 到 {dates_batch[-1]}")
+
+        try:
+            
+            etb_stats, vtb_stats = process_daily_batch(
+                dates_batch, input_folder, et_folder, vt_folder, precip_folder,
+                soil_capacity, soil_initial, soil_bounds, M,
+                bias_et_vt, sigma_et_vt, sigma_precip
+            )
+
+            # save
+            
+            for di, date in enumerate(dates_batch):
+                etb_std = etb_stats[di].get_std()
+                vtb_std = vtb_stats[di].get_std()
+
+                for arr, name in [(etb_std, "ETbedrock_std"), (vtb_std, "VTbedrock_std")]:
+                    out_meta = meta_profile.copy()
+                    out_meta.update(dtype="float32", nodata=-9999)
+                    out_path = os.path.join(out_uncertainty, f"{name}_{date}.tif")
+
+                    with rasterio.open(out_path, "w", **out_meta) as dst:
+                        dst.write(arr.astype(np.float32), 1)
+
+            print(f" {batch_start // batch_size + 1} daone")
+
+        except Exception as e:
+            print(f"wrong: {e}")
+            print("Try to reduce the batch size or the number of Monte Carlo operations")
+
+        finally:
+            
+            gc.collect()
+
+    print(f"\n all save to: {out_uncertainty}")
+    print(f": {get_memory_usage():.2f} GB")
+
+
+if __name__ == "__main__":
+    main()
