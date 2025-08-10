@@ -1,0 +1,623 @@
+###----------PART 1 causal forest algorithm (CausalForestDML)  within the double machine learning framework -----------------###
+# -*- coding: utf-8 -*-
+import os
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.warp import reproject, Resampling
+
+from econml.dml import CausalForestDML
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LassoCV, LinearRegression
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import warnings
+from scipy import stats
+
+warnings.filterwarnings('ignore')
+
+# ---------------------- 字体 & 负号 ----------------------
+mpl.rcParams["font.family"] = "Arial"
+mpl.rcParams["xtick.labelsize"] = 14
+mpl.rcParams["ytick.labelsize"] = 12
+
+
+base = r"path to base floder"
+climate_fp = os.path.join(base, "climate types.tif")
+
+fps = {
+    "AGC": os.path.join(base, "AGC.tif"),
+    "BGC": os.path.join(base, "BGC.tif"),
+    "GPP": os.path.join(base, "GPP.tif"),
+    "NPP": os.path.join(base, "NPP.tif"),
+    "VT1": os.path.join(base, "treatment variable.tif"),
+
+    "VT": os.path.join(base, "total VT.tif"),
+    "total_P": os.path.join(base, "Soil totl N.tif"),
+    "total_N": os.path.join(base, "Soil totl P.tif"),
+    "precipitation": os.path.join(base, "Total precipitation.tif"),
+    "altitude": os.path.join(base, "Altitude.tif"),
+    "veg": os.path.join(base, "vegetation types.tif"),
+}
+
+climate_mapping = {
+    1: "Af", 2: "Am", 3: "Aw", 5: "BWk", 6: "BSh", 7: "BSk",
+    11: "Cwa", 12: "Cwb", 14: "Cfa", 15: "Cfb", 16: "Cfc",
+    19: "Dsc", 21: "Dwa", 22: "Dwb", 23: "Dwc", 25: "Dfa",
+    26: "Dfb", 27: "Dfc", 29: "ET", 30: "EF"
+}
+selected_codes = sorted(climate_mapping.keys())
+
+targets = ["AGC", "BGC", "GPP", "NPP"]
+covariates = ["total_P", "total_N", "precipitation", "VT", "altitude"]
+
+
+MAX_SAMPLES = 100000
+RANDOM_SEED = 2025
+
+print(f"Max smaples: {MAX_SAMPLES}")
+
+
+# read climate file
+
+with rasterio.open(climate_fp) as ref:
+    ref_trans, ref_crs = ref.transform, ref.crs
+    w, h = ref.width, ref.height
+    clim = ref.read(1).astype(float)
+    clim[clim == ref.nodata] = np.nan
+
+data = {"climate": clim.flatten()}
+
+
+# 4. resample and built DataFrame
+
+for name, fp in fps.items():
+    print(f"处理 {name}...")
+    with rasterio.open(fp) as src:
+        arr = src.read(1).astype(float)
+        dst = np.full((h, w), np.nan, dtype=float)
+        reproject(arr, dst,
+                  src_transform=src.transform, src_crs=src.crs,
+                  dst_transform=ref_trans, dst_crs=ref_crs,
+                  resampling=Resampling.bilinear)
+        if src.nodata is not None:
+            dst[dst == src.nodata] = np.nan
+        dst[np.isinf(dst)] = np.nan
+        if name not in ("veg",):
+            dst[dst < 0] = np.nan
+        data[name] = dst.flatten()
+
+print("构建DataFrame...")
+df = pd.DataFrame(data)
+print(f"origonal sample size: {len(df)}")
+
+# selection available data
+df = df[df["climate"].isin(selected_codes)].copy()
+print(f"available data: {len(df)}")
+
+# delet na
+df.dropna(subset=["VT1"] + targets + covariates, inplace=True)
+
+
+df["clim_label"] = df["climate"].map(climate_mapping)
+
+
+# Scale and outlier handling
+
+print("\n=== Original target variable statistical information ===")
+target_stats_original = {}
+for tgt in targets:
+    stats_info = {
+        'mean': df[tgt].mean(),
+        'std': df[tgt].std(),
+        'min': df[tgt].min(),
+        'max': df[tgt].max(),
+        'median': df[tgt].median(),
+        'q25': df[tgt].quantile(0.25),
+        'q75': df[tgt].quantile(0.75)
+    }
+    target_stats_original[tgt] = stats_info
+    print(f"{tgt}: mean={stats_info['mean']:.3f}, std={stats_info['std']:.3f}, "
+          f"range=[{stats_info['min']:.3f}, {stats_info['max']:.3f}]")
+
+
+# outlier handling
+def remove_extreme_outliers(data, factor=3.0):
+    
+    Q1 = data.quantile(0.25)
+    Q3 = data.quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - factor * IQR
+    upper_bound = Q3 + factor * IQR
+    return data.clip(lower_bound, upper_bound)
+
+for tgt in targets:
+    original_count = len(df)
+    df[tgt] = remove_extreme_outliers(df[tgt], factor=3.0)
+    print(f"{tgt}: outlier done")
+
+# scale handling
+target_scalers = {}
+
+for tgt in targets:
+    df[f"{tgt}_original"] = df[tgt].copy()
+
+    
+    if df[tgt].min() > 0:  
+        skewness = stats.skew(df[tgt])
+        print(f"{tgt} Skewness: {skewness:.3f}")
+
+        if abs(skewness) > 1.5:  
+            print(f"   {tgt} log processing")
+            df[f"{tgt}_log"] = np.log1p(df[tgt])  # 使用log1p避免log(0)
+            skewness_after = stats.skew(df[f"{tgt}_log"])
+            print(f"  skew after log processing: {skewness_after:.3f}")
+            
+            scaler = RobustScaler()  
+            df[f"{tgt}_scaled"] = scaler.fit_transform(df[f"{tgt}_log"].values.reshape(-1, 1)).flatten()
+        else:
+            
+            scaler = RobustScaler()
+            df[f"{tgt}_scaled"] = scaler.fit_transform(df[tgt].values.reshape(-1, 1)).flatten()
+    else:
+        
+        scaler = RobustScaler()
+        df[f"{tgt}_scaled"] = scaler.fit_transform(df[tgt].values.reshape(-1, 1)).flatten()
+
+    target_scalers[tgt] = scaler
+
+
+print("\n=== Standardized statistical information of the target variable ===")
+for tgt in targets:
+    scaled_col = f"{tgt}_scaled"
+    stats_info = {
+        'mean': df[scaled_col].mean(),
+        'std': df[scaled_col].std(),
+        'min': df[scaled_col].min(),
+        'max': df[scaled_col].max(),
+        'median': df[scaled_col].median()
+    }
+    print(f"{tgt}: mean={stats_info['mean']:.3f}, std={stats_info['std']:.3f}, "
+          f"range=[{stats_info['min']:.3f}, {stats_info['max']:.3f}]")
+
+
+targets_scaled = [f"{tgt}_scaled" for tgt in targets]
+
+
+if len(df) > MAX_SAMPLES:
+    print(f"The data volume is too large. Random sampling is conducted to {MAX_SAMPLES} samples...")
+    sampled_dfs = []
+    for climate_code in df["climate"].unique():
+        climate_df = df[df["climate"] == climate_code]
+        n_samples_climate = min(len(climate_df),
+                                max(1, int(MAX_SAMPLES * len(climate_df) / len(df))))
+        if len(climate_df) > n_samples_climate:
+            climate_sample = climate_df.sample(n=n_samples_climate,
+                                               random_state=RANDOM_SEED)
+        else:
+            climate_sample = climate_df
+        sampled_dfs.append(climate_sample)
+
+    df = pd.concat(sampled_dfs, ignore_index=True)
+    print(f"采样后样本数: {len(df)}")
+
+
+veg_dummies = pd.get_dummies(df["veg"].astype(int), prefix="veg")
+df = pd.concat([df, veg_dummies], axis=1)
+covariates += list(veg_dummies.columns)
+
+# Residual processing
+
+X_base = df[["VT", "total_P", "total_N", "precipitation", "attitude"] + list(veg_dummies.columns)]
+
+scaler_resid = StandardScaler()
+X_scaled = scaler_resid.fit_transform(X_base)
+
+for tvar in ["VT1"]:
+    print(f" {tvar} Residual processing...")
+    lr = LinearRegression()
+    lr.fit(X_scaled, df[tvar])
+    predictions = lr.predict(X_scaled)
+    df[f"{tvar}_resid"] = df[tvar] - predictions
+
+treatment_vars = ["VT1_resid"]
+
+
+# Standardized pretreatment
+
+
+scaler_X = StandardScaler()
+scaler_T = StandardScaler()
+
+
+#CausalForestDML fit & effects analysis
+
+
+results = {}
+treatment_effects_df = pd.DataFrame()
+
+for tgt_scaled, tgt_original in zip(targets_scaled, targets):
+    print(f"Anlyzing: {tgt_original}")
+
+    try:
+        
+        Y = df[tgt_scaled].values
+        if Y.ndim > 1:
+            Y = Y.ravel()
+
+        
+        X = scaler_X.fit_transform(df[covariates].values)
+        T = scaler_T.fit_transform(df[treatment_vars].values)
+
+        # CausalForest fit
+        cfdml = CausalForestDML(
+            model_y=LassoCV(cv=3),
+            model_t=RandomForestRegressor(n_estimators=50, min_samples_leaf=10),
+            n_estimators=100,
+            min_samples_leaf=10,
+            random_state=RANDOM_SEED,
+            n_jobs=1
+        )
+
+       
+        cfdml.fit(Y=Y, T=T, X=X)
+
+        # calculate ATE
+        
+        ATE = cfdml.ate(X)
+        if ATE.ndim > 1:
+            ATE = ATE.flatten()
+
+        # TE
+        
+        TE = cfdml.effect(X)
+
+        # save results
+        for i, var in enumerate(treatment_vars):
+            if TE.ndim == 1:
+                df[f"TE_{tgt_original}_{var}"] = TE if i == 0 else np.zeros_like(TE)
+            else:
+                df[f"TE_{tgt_original}_{var}"] = TE[:, i]
+
+        results[tgt_original] = {"ATE": ATE}
+        print(f"  {tgt_original} ATE: {ATE}")
+
+    except Exception as e:
+        print(f"Wrong {tgt_original} during: {str(e)}")
+        import traceback
+
+        print(f"{traceback.format_exc()}")
+        continue
+
+
+# Summary & Visualization
+
+grouped = {}
+
+for tvar in ["VT1_resid"]:
+    cols = [f"TE_{t}_{tvar}" for t in targets if f"TE_{t}_{tvar}" in df.columns]
+    if cols:
+        grp = df.groupby("clim_label")[cols].mean().reindex(
+            sorted(df["clim_label"].unique())
+        )
+
+        
+        grp.columns = [col.replace(f"TE_", "").replace(f"_{tvar}", "") for col in grp.columns]
+        grouped[tvar] = grp
+
+if grouped:
+    
+    fig, axes = plt.subplots(1, len(grouped), figsize=(8 * len(grouped), 8),
+                             sharey=True if len(grouped) > 1 else False)
+
+    if len(grouped) == 1:
+        axes = [axes]
+
+    
+    all_values = []
+    for grp in grouped.values():
+        all_values.extend(grp.values.flatten())
+
+    vmin, vmax = np.nanmin(all_values), np.nanmax(all_values)
+    abs_max = max(abs(vmin), abs(vmax))
+
+    
+    vmin_sym, vmax_sym = -abs_max, abs_max
+
+    for ax, (tvar, grp) in zip(axes, grouped.items()):
+        # 使用更加对比鲜明的颜色映射
+        sns.heatmap(grp,
+                    cmap="RdBu_r",  
+                    center=0,
+                    vmin=vmin_sym,
+                    vmax=vmax_sym,
+                    annot=True,
+                    fmt=".4f",  
+                    linewidths=0.8,
+                    ax=ax,
+                    cbar_kws={"shrink": 0.8, "aspect": 20})
+
+        
+        var_name = "xxxx" if "VT1" in tvar else "yyy"
+        ax.set_title(f"TEs of {var_name}", fontsize=16, fontweight='bold', pad=20)
+        ax.set_xlabel("Climate types", fontsize=14, fontweight='bold')
+        if ax is axes[0]:
+            ax.set_ylabel("", fontsize=14, fontweight='bold')
+
+       
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+
+    plt.tight_layout()
+
+    # save
+    out_fp = r"xxxx.png"
+
+    try:
+        plt.savefig(out_fp, dpi=600, bbox_inches="tight", facecolor='white', edgecolor='none')
+        
+    except Exception as e:
+        print(f"wrong: {str(e)}")
+       
+
+    #plt.show()
+
+    
+    fig2, axes2 = plt.subplots(len(targets), len(treatment_vars),
+                               figsize=(6 * len(treatment_vars), 4 * len(targets)))
+
+    if len(targets) == 1:
+        axes2 = axes2.reshape(1, -1)
+    if len(treatment_vars) == 1:
+        axes2 = axes2.reshape(-1, 1)
+
+    for i, tgt in enumerate(targets):
+        for j, tvar in enumerate(treatment_vars):
+            col_name = f"TE_{tgt}_{tvar}"
+            if col_name in df.columns:
+                
+                df_plot = df[['clim_label', col_name]].copy()
+                df_plot = df_plot.dropna()
+
+                sns.boxplot(data=df_plot, x='clim_label', y=col_name, ax=axes2[i, j])
+                axes2[i, j].set_title(f"{tgt} - {tvar.replace('_resid', '')}")
+                axes2[i, j].tick_params(axis='x', rotation=45)
+                axes2[i, j].axhline(y=0, color='red', linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+
+    # save
+    out_fp2 = r"xxxxx"
+    try:
+        plt.savefig(out_fp2, dpi=600, bbox_inches="tight", facecolor='white', edgecolor='none')
+        
+    except Exception as e:
+        print(f"wrong: {str(e)}")
+
+    #plt.show()
+
+else:
+    print("No valid processing effect data was generated, so the visualization was skipped")
+
+# ----------------------------------------
+# 12. save to csv
+# ----------------------------------------
+
+for tgt in targets:
+    original_stats = target_stats_original[tgt]
+    
+    if f"{tgt}_scaled" in df.columns:
+        scaled_stats = {
+            'mean': df[f"{tgt}_scaled"].mean(),
+            'std': df[f"{tgt}_scaled"].std(),
+            'min': df[f"{tgt}_scaled"].min(),
+            'max': df[f"{tgt}_scaled"].max()
+        }
+        
+
+
+for tgt, result in results.items():
+    print(f"\n{tgt}:")
+    ate = result['ATE']
+    if hasattr(ate, '__len__') and len(ate) > 1:
+        for i, var in enumerate(treatment_vars):
+            print(f"  {var.replace('_resid', '')} 的ATE: {ate[i]:.6f}")
+    else:
+        print(f"  ATE: {float(ate):.6f}")
+
+
+
+for tgt in targets:
+    for tvar in treatment_vars:
+        col_name = f"TE_{tgt}_{tvar}"
+        if col_name in df.columns:
+            te_stats = {
+                'mean': df[col_name].mean(),
+                'std': df[col_name].std(),
+                'min': df[col_name].min(),
+                'max': df[col_name].max(),
+                'q25': df[col_name].quantile(0.25),
+                'q75': df[col_name].quantile(0.75)
+            }
+            print(f"\n{tgt} - {tvar.replace('_resid', '')}:")
+            print(f"  mean: {te_stats['mean']:.6f}")
+            print(f"  std: {te_stats['std']:.6f}")
+            print(f"  范围: [{te_stats['min']:.6f}, {te_stats['max']:.6f}]")
+            print(f"  IQR range: [{te_stats['q25']:.6f}, {te_stats['q75']:.6f}]")
+
+
+
+# save
+try:
+    output_data_path = r"TEs.csv"
+    
+    save_cols = ['climate', 'clim_label'] + targets + [f"{t}_scaled" for t in targets]
+    save_cols += [f"TE_{t}_{v}" for t in targets for v in treatment_vars if f"TE_{t}_{v}" in df.columns]
+
+    df_save = df[save_cols].copy()
+    df_save.to_csv(output_data_path, index=False, encoding='utf-8-sig')
+    
+except Exception as e:
+    print(f"wrong: {str(e)}")
+
+###----------PART 2 Significance analysis -----------------###
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+import matplotlib as mpl
+import warnings
+from scipy import stats
+
+warnings.filterwarnings('ignore')
+
+
+mpl.rcParams["font.family"] = "Arial"
+mpl.rcParams["xtick.labelsize"] = 14
+mpl.rcParams["ytick.labelsize"] = 12
+# path setting
+csv_path = r"Tes.csv"
+out_dir  = r"path for output"
+fig_dir  = os.path.join(out_dir, "figures")
+
+os.makedirs(out_dir, exist_ok=True)
+os.makedirs(fig_dir, exist_ok=True)
+
+
+
+targets   = ["AGC", "BGC", "GPP", "NPP"]
+te_col_map = {t: f"TE_{t}_VT1_resid" for t in targets}
+
+
+df = pd.read_csv(csv_path)
+
+
+req_cols = {"climate", "clim_label"}
+if not req_cols.issubset(df.columns) or not set(te_col_map.values()).issubset(df.columns):
+    raise RuntimeError("The original table is missing necessary fields")
+
+
+long_list = []
+for tgt, te_col in te_col_map.items():
+    tmp = df[["climate", "clim_label", te_col]].rename(columns={te_col: "TE"})
+    tmp["target"] = tgt
+    long_list.append(tmp)
+long_df = pd.concat(long_list, ignore_index=True)
+long_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+long_df.dropna(subset=["TE", "climate", "clim_label", "target"], inplace=True)
+
+
+clim_order = (
+    long_df[["climate","clim_label"]]
+    .drop_duplicates()
+    .sort_values(["climate", "clim_label"])
+)
+labels = clim_order["clim_label"].tolist()
+long_df["clim_label"] = pd.Categorical(long_df["clim_label"],
+                                       categories=labels, ordered=True)
+
+#  Single sample t-tests were conducted and the mean, std, CI, and Cohen's d were calculated
+def calc_ci(mean, sd, n, alpha=0.05):
+    if n < 2 or sd == 0 or not np.isfinite(sd):
+        return np.nan, np.nan
+    se = sd / np.sqrt(n)
+    tval = stats.t.ppf(1 - alpha/2, df=n-1)
+    return mean - tval*se, mean + tval*se
+
+results = []
+grouped = long_df.groupby(["climate", "clim_label", "target"], sort=False)
+for (clim, label, tgt), grp in grouped:
+    arr = grp["TE"].dropna().values
+    n   = arr.size
+    if n == 0:
+        continue
+    mean_te = arr.mean()
+    sd_te   = arr.std(ddof=1) if n>1 else np.nan
+    # t-test
+    if n >= 2:
+        t_stat, p_val = stats.ttest_1samp(arr, popmean=0.0)
+    else:
+        t_stat, p_val = np.nan, np.nan
+    ci_low, ci_high = calc_ci(mean_te, sd_te, n)
+    cohend = mean_te/sd_te if n>1 and sd_te>0 else np.nan
+
+    results.append({
+        "climate": clim,
+        "clim_label": label,
+        "target": tgt,
+        "n": n,
+        "mean_TE": mean_te,
+        "sd_TE": sd_te,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "t_stat": t_stat,
+        "p_value": p_val,
+        "cohens_d": cohend
+    })
+
+res_df = pd.DataFrame(results).dropna(subset=["p_value"])
+
+# FDR correction
+rej, p_fdr, _, _ = multipletests(res_df["p_value"].values, alpha=0.05, method="fdr_bh")
+res_df["p_fdr"] = p_fdr
+res_df["signif_fdr"] = rej
+
+# save statistical information
+signif_csv = os.path.join(out_dir, "vt1_te_significance_by_climate.csv")
+res_df.sort_values(["climate","target"]).to_csv(signif_csv,
+                                               index=False,
+                                               encoding="utf-8-sig")
+
+
+
+
+
+# Visualization: Forest Plot - mean ±95%CI for each target variable
+def plot_forest(df_stats, tgt):
+    sub = df_stats[df_stats["target"]==tgt].copy()
+    if sub.empty:
+        return
+    sub.sort_values("climate", inplace=True)
+    y_pos = np.arange(len(sub))
+    means = sub["mean_TE"].values
+    ci_l, ci_h = sub["ci_low"].values, sub["ci_high"].values
+    err   = np.vstack([means-ci_l, ci_h-means])
+    colors = ["#d62728" if sig else "#1f77b4"
+              for sig in sub["signif_fdr"].values]
+
+    plt.figure(figsize=(8, max(4,0.4*len(sub)+1)))
+    for i,(m, el, eh, c) in enumerate(zip(means, err[0], err[1], colors)):
+        plt.errorbar(m, i, xerr=[[el],[eh]], fmt='o',
+                     color=c, ecolor=c, capsize=4, markersize=6)
+    plt.axvline(0, color="gray", linestyle="--", linewidth=1)
+    plt.yticks(y_pos, sub["clim_label"])
+    plt.xlabel("ATE with ±95% CI (Standardization)")
+
+    
+    from matplotlib.lines import Line2D
+    legend_elems = [
+        Line2D([0],[0], marker='o', color='w', label='FDR<0.05',
+               markerfacecolor='#d62728', markersize=8),
+        Line2D([0],[0], marker='o', color='w', label='No significance',
+               markerfacecolor='#1f77b4', markersize=8)
+    ]
+    plt.legend(handles=legend_elems, loc="best")
+
+    out_png = os.path.join(fig_dir, f"VT1_TE_forest_{tgt}.png")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.close()
+    
+
+print("All Fucking done!!!!!!!!!!")
