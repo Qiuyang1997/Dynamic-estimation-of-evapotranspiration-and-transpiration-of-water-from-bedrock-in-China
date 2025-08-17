@@ -165,11 +165,12 @@ from rasterio.windows import from_bounds
 
 # Define the input and output paths
 # Define the input folder and the paths of related files
-input_folder = r"I:\A_daily"  
+input_folder = "A folder"  
 soil_file = r"soil available water capacity.tif" ## Calculated based on the wilting coefficient and field water holding capacity
 soil_initial_file = r"soil available water capacity initial.tif"## Set as the Minimum value of initial with 0 and "soil available water capacity.tif" in part 2
 
-vt_data_folder = r"path to daily vegetation transpiration fata"  
+vt_data_folder = r"path to daily vegetation transpiration data" 
+p_data_folder = r"path to daily precipitation data"
 daily_output_folder = r"VT_bedock daily"  
 os.makedirs(daily_output_folder, exist_ok=True)
 
@@ -201,16 +202,17 @@ for file_name in daily_files:
     # Extract the date string (such as "20100801")
     date_str = file_name[1:9]
 
-    # Build the corresponding vt_data file path (named in the format of "VTYYYYMMDD.tif")
+    # Build the corresponding vt_data file path (such as named in the format of "VTYYYYMMDD.tif")
     vt_file_name = f"VT{date_str}.tif"
-    vt_file_path = os.path.join(ec_data_folder, ec_file_name)
-
+    vt_file_path = os.path.join(ec_data_folder, ec_file_name)  p_data_folder
+    p_file_name = f"p{date_str}.tif"
+    p_file_path = os.path.join(p_data_folder, p_file_name)
     
     with rasterio.open(ec_file_path) as ec_src:
         window = from_bounds(*soil_bounds, transform=ec_src.transform)
         ec_data = ec_src.read(1, window=window).astype(np.float64)
 
-    # read ET-P
+    # read ET-P (A)
     file_path = os.path.join(input_folder, file_name)
     with rasterio.open(file_path) as evap_src:
         window = from_bounds(*soil_bounds, transform=evap_src.transform)
@@ -236,11 +238,13 @@ for file_name in daily_files:
         # Determine whether the current soil available water is lower than the vt_data requirements
         condition = (soil_water[positive_diff] < vt_data[positive_diff])
         # Calculate the amount of vegetation transpiration provided by the bedrock-stored water (VT_bedsrock) and replenish it only when the conditions are not met
-        rock_provide = vt_data[positive_diff] - soil_water[positive_diff]
-        rock_provide[~condition] = 0
-
+        aaa = vt_data[positive_diff]-p_data[positive_diff] - soil_water[positive_diff]
+        rock_provide_VT = max (0,a)
+        rock_provide_VT[~condition] = 0
+        #rock_provide_ET = evap_diff[positive_diff] - soil_water[positive_diff]
+        #rock_provide_ET[~condition] = 0
         # updata value
-        daily_rock_water[positive_diff] = rock_provide
+        daily_rock_water[positive_diff] = rock_provide_VT
 
         
         soil_water[positive_diff] -= evap_diff[positive_diff]
