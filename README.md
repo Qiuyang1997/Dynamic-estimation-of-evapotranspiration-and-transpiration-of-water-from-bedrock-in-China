@@ -14,5 +14,6 @@ https://github.com/user-attachments/assets/91e6831f-f208-4f82-8604-2bdfdaebc39a
 
 
 
-<img width="4331" height="3543" alt="技术流程图" src="https://github.com/user-attachments/assets/949b20dd-6c68-44be-af5a-c9e15ef27147" />
+<img width="4331" height="3378" alt="Figure 1new" src="https://github.com/user-attachments/assets/df08ef5a-6571-45ac-84e6-fa9931cf3b4a" />
+
 
